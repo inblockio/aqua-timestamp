@@ -7,6 +7,9 @@
 //! ```
 //!
 //! Environment:
+//! - `STRESS_TEST_CLIENT_KEY` (optional hex private key; when set, the same
+//!   DID is reused across runs so witnesses from prior epochs remain
+//!   fetchable. Generate one and store it in `.env` for persistent testing.)
 //! - `TIMESTAMP_BASE_URL` (default `https://timestamp.inblock.io`)
 //! - `STRESS_COUNT` (default `1000`)
 //! - `STRESS_METHOD` (default `evm`; also accepts `qtsa`)
@@ -14,6 +17,8 @@
 //! - `STRESS_EPOCH_ALIGN_BUFFER_SECS` (default `2`; wait this much past the
 //!   reported epoch_closes_at before submitting, to be sure we land in the
 //!   new epoch and not race the seal)
+//! - `STRESS_FETCH_SPREAD_SECS` (default `60`; spread witness fetches over
+//!   this many seconds to avoid thundering-herd load on the server)
 //!
 //! The exit code is non-zero if any single submission or witness verification
 //! fails. Witness signatures are verified by the client during fetch, so a
@@ -57,10 +62,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parallel: usize = env_parsed("STRESS_PARALLEL", 32usize);
     let align_buffer: u64 = env_parsed("STRESS_EPOCH_ALIGN_BUFFER_SECS", 2u64);
 
-    // ── ephemeral keypair ────────────────────────────────────────────────
-    let mut key_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key_bytes);
-    let wallet = PrivateKeySigner::from_bytes(&key_bytes.into())?;
+    // ── client keypair (persistent from STRESS_TEST_CLIENT_KEY, or ephemeral) ─
+    let (wallet, key_source) = match std::env::var("STRESS_TEST_CLIENT_KEY") {
+        Ok(hex_key) => {
+            let bytes = hex::decode(hex_key.trim_start_matches("0x"))?;
+            let wallet = PrivateKeySigner::from_bytes(&bytes.as_slice().try_into()?)?;
+            (wallet, "persistent (.env)")
+        }
+        Err(_) => {
+            let mut key_bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut key_bytes);
+            let wallet = PrivateKeySigner::from_bytes(&key_bytes.into())?;
+            (wallet, "ephemeral (random)")
+        }
+    };
     let address = wallet.address();
     let did = format!("did:pkh:eip155:1:{}", address.to_checksum(None));
     let wallet_for_signer = wallet.clone();
@@ -75,7 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("method        = {}", method.as_str());
     println!("parallel      = {parallel}");
     println!("align_buffer  = {align_buffer}s");
-    println!("ephemeral DID = {did}");
+    println!("client key    = {key_source}");
+    println!("client DID    = {did}");
 
     let client = TimestampClient::builder()
         .base_url(&base_url)
@@ -120,8 +136,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         leaves.push(b);
     }
 
+    const MAX_BATCH: usize = 10_000;
     let submit_started = Instant::now();
-    let receipts = client.submit_many(&leaves).await?;
+    let mut receipts = Vec::with_capacity(count);
+    for (batch_idx, chunk) in leaves.chunks(MAX_BATCH).enumerate() {
+        let batch_receipts = client.submit_many(chunk).await?;
+        println!(
+            "  batch {}: submitted {} leaves (epoch_id={}, closes_at={})",
+            batch_idx,
+            batch_receipts.len(),
+            batch_receipts[0].epoch_id,
+            batch_receipts[0].epoch_closes_at
+        );
+        receipts.extend(batch_receipts);
+    }
     let submit_elapsed = submit_started.elapsed();
     println!(
         "submitted {} leaves in {:.2}s (server epoch_id={}, closes_at={})",
@@ -156,12 +184,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seal_elapsed = seal_started.elapsed();
     println!("epoch sealed in {:.1}s", seal_elapsed.as_secs_f64());
 
-    // ── fetch all witnesses in parallel, bounded by Semaphore ────────────
+    // ── fetch witnesses with staggered jitter ─────────────────────────────
+    // Spread fetches over STRESS_FETCH_SPREAD_SECS (default 60) so we
+    // simulate realistic client arrival rather than a thundering herd.
+    let fetch_spread: u64 = env_parsed("STRESS_FETCH_SPREAD_SECS", 60u64);
+    println!("fetching {} witnesses (parallel={}, spread={}s)...", count, parallel, fetch_spread);
+
     let fetch_started = Instant::now();
     let sem = Arc::new(Semaphore::new(parallel));
     let client = Arc::new(client);
     let mut handles = Vec::with_capacity(count);
     for (idx, receipt) in receipts.iter().enumerate() {
+        // Per-fetch jitter: uniformly spread across [0, fetch_spread].
+        if fetch_spread > 0 && count > 1 {
+            let delay_ms = (idx as u64 * fetch_spread * 1000) / (count as u64 - 1);
+            sleep(Duration::from_millis(delay_ms.saturating_sub(
+                fetch_started.elapsed().as_millis() as u64,
+            ))).await;
+        }
         let permit = sem.clone().acquire_owned().await?;
         let client = client.clone();
         let leaf = receipt.leaf;
@@ -172,7 +212,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match client.try_fetch_witness(&leaf, method).await {
                     Ok(Some(pair)) => return Ok::<(usize, _), ClientError>((idx, pair)),
                     Ok(None) => {
-                        // Seal-vs-witness materialisation lag. Retry briefly.
                         tries += 1;
                         if tries > 6 {
                             return Err(ClientError::WitnessMissing {
@@ -205,6 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("witness ok    : {}", ok);
     println!("witness fail  : {}", errors.len());
     println!("submit time   : {:.2}s ({:.0} hashes/s)", submit_elapsed.as_secs_f64(), count as f64 / submit_elapsed.as_secs_f64().max(0.001));
+    println!("fetch spread  : {}s", fetch_spread);
     println!("seal wait     : {:.1}s", seal_elapsed.as_secs_f64());
     println!("fetch time    : {:.2}s ({:.0} witnesses/s, parallel={})", fetch_elapsed.as_secs_f64(), ok as f64 / fetch_elapsed.as_secs_f64().max(0.001), parallel);
     if !errors.is_empty() {
