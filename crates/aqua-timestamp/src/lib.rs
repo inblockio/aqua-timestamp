@@ -276,6 +276,30 @@ pub async fn build_app(
     let rendered_skill_md = docs::render_skill_md(&identity);
     let rendered_skill_auth_md = docs::render_skill_auth_md(&identity);
 
+    // Health tick: periodic SSE event with cumulative totals so the landing
+    // page always shows the correct "Leaves timestamped" count, even for
+    // clients that connect between epoch seals.
+    {
+        let bus = event_bus.clone();
+        let store_for_tick = store.clone();
+        let started = std::time::Instant::now();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let (epochs_total, leaves_total) = match store_for_tick.totals() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                bus.send(aqua_timestamp_core::events::SseEvent::HealthTick {
+                    uptime_secs: started.elapsed().as_secs(),
+                    epochs_total,
+                    leaves_total,
+                });
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         started_at: std::time::Instant::now(),
         config: cfg,

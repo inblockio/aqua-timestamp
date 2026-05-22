@@ -487,6 +487,19 @@ impl Store {
         Ok(())
     }
 
+    /// Aggregate totals across all sealed epochs: `(epoch_count, total_leaves)`.
+    pub fn totals(&self) -> Result<(u64, u64), StoreError> {
+        let mut epoch_count: u64 = 0;
+        let mut total_leaves: u64 = 0;
+        for kv in self.epochs.iter() {
+            let (_, v) = kv?;
+            let rec: EpochRecord = postcard::from_bytes(&v).map_err(StoreError::Decode)?;
+            epoch_count += 1;
+            total_leaves += rec.leaf_count;
+        }
+        Ok((epoch_count, total_leaves))
+    }
+
     /// Count of unique contributor addresses.
     pub fn contributor_count(&self) -> Result<usize, StoreError> {
         let mut count = 0;

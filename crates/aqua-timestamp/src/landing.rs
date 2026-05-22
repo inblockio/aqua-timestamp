@@ -1650,8 +1650,13 @@ section + section {
       $('evm-last-anchor').textContent = timeAgo(lastSealedAt);
       $('qtsa-last-anchor').textContent = timeAgo(lastSealedAt);
     }
-    if (data.last_sealed_epoch_id != null) {
+    if (data.epochs_total != null) {
+      $('stat-epochs').textContent = String(data.epochs_total);
+    } else if (data.last_sealed_epoch_id != null) {
       $('stat-epochs').textContent = String(data.last_sealed_epoch_id + 1);
+    }
+    if (data.leaves_total != null) {
+      $('stat-leaves').textContent = String(data.leaves_total);
     }
   }
 

@@ -200,6 +200,8 @@ pub struct ScheduleResponse {
     pub last_sealed_epoch_id: Option<u64>,
     pub last_sealed_at: Option<u64>,
     pub anchor_methods: Vec<&'static str>,
+    pub epochs_total: u64,
+    pub leaves_total: u64,
 }
 
 pub async fn schedule(
@@ -221,6 +223,11 @@ pub async fn schedule(
         None => None,
     };
 
+    let (epochs_total, leaves_total) = state
+        .store
+        .totals()
+        .map_err(|e| ScheduleError(format!("store: {e}")))?;
+
     Ok(Json(ScheduleResponse {
         current_epoch_id: view.epoch_id,
         current_epoch_opened_at: view.opened_at,
@@ -229,6 +236,8 @@ pub async fn schedule(
         last_sealed_epoch_id: last_sealed_id,
         last_sealed_at,
         anchor_methods: ANCHOR_METHODS.to_vec(),
+        epochs_total,
+        leaves_total,
     }))
 }
 
